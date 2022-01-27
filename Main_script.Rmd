@@ -1,0 +1,888 @@
+---
+title: 'Validation project'
+output:
+  html_document:
+    toc: TRUE
+    toc_float:
+      collapsed: FALSE
+      smooth_scroll: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      error=FALSE,
+                      warning=FALSE)
+library(dplyr)
+library(tidyr)
+require(lubridate)
+library(ggplot2)
+library(stringr)
+library(zoo)
+library(readxl)
+library(flextable)
+
+```
+
+# Импорт данных
+
+Импорт нескольких листов базы данных в  несколько датафреймов:
+
+df1 - общая информация о пациентах
+
+df2 - даты поступления и перевода пациентов из отделения в отделение
+
+df3 - экстренные анализы
+
+df4 - плановые анализы
+
+При импорте переводим столбец id в факторную переменную, а у листов с анализами
+приводим названия столбцов к общему виду.
+
+```{r}
+
+df1 <- read_excel("data/raw/COVID_PROJECT_UPDATE_16.11.2021.xlsx", "Lista totala") %>% 
+    mutate(id = as.factor(id))
+
+df2 <- read_excel("data/raw/COVID_PROJECT_UPDATE_16.11.2021.xlsx", "Transferuri")  %>% 
+    mutate(id = as.factor(id))
+
+df3 <- read_excel("data/raw/COVID_PROJECT_UPDATE_16.11.2021.xlsx", "Analize de urgenta") %>% 
+    rename(date = AppliedDate, test = name, value = Value) %>% 
+    mutate(id = as.factor(id))
+
+df4 <- read_excel("data/raw/COVID_PROJECT_UPDATE_16.11.2021.xlsx", "Analize planice") %>% 
+    rename(date = Date, test = Name, value = rezultat) %>% 
+    mutate(id = as.factor(id))
+```
+Сшиваем датафреймы с анализами в один датафрейм
+
+```{r}
+
+df_test <- rbind(df3, df4)
+
+```
+
+Считаем число уникальных пациентов в трех датафреймах
+
+```{r}
+length(unique(df1$id))      #4399
+length(unique(df2$id))      #4404
+length(unique(df_test$id))  #4183
+```
+
+Модифицируем датафрейм df2, чтобы суммировать данные по переводам из отделения в отделение в общую продолжительность госпитализации
+
+```{r}
+# Разделение колонок дата_время на отдельные колонки:
+
+df2_m <- df2 %>% 
+  separate(StartDate, c("StartDate", "StartTime"), sep = " ") %>%
+  separate(EndDate, c("EndDate", "EndTime"), sep = " ")
+
+# Перевод дат в формат, пригодный для вычисления дней:
+
+df2_m$StartDate <- as.Date(df2_m$StartDate, format ="%Y-%m-%d")
+df2_m$EndDate <- as.Date(df2_m$EndDate, format="%Y-%m-%d")
+
+# Считаем продолжительность госпитализации в днях (для пациентов поступивших и выписавшихся в тот же день значение равно 0)
+
+df2_m$hospit_days <- df2_m$EndDate - df2_m$StartDate
+
+# Суммируем продолжительность госпитализации по пациентам в один датасет
+
+hosp_days <- df2_m %>%                                       
+  group_by(id) %>%                         
+  summarise(hospit_days_total = sum(hospit_days)) 
+
+# Преобразуем наш датасет сливая с датасетом по продолжительности госпитализации
+
+df2_new <-  merge(df2_m, hosp_days, by="id")
+df2_new$OutcomeDate <- df2_new$StartDate + df2_new$hospit_days_total 
+
+# оставляем только одну верхнюю строку для каждого пациента и нужные столбцы 
+
+df2_short <- df2_new[row.names(unique(df2_new[,c("id", "hospit_days_total")])),]
+
+# how many patients?
+
+length(unique(df2_short$id)) #4404
+
+# Удалим из памяти промежуточные датафреймы
+
+rm(df2_m, df2_new)
+```
+
+
+Делаем один датафрэйм с общей информацией о пациентах объединяя датафреймы df1 и df2 по id пациентов 
+
+```{r}
+
+df_patients_raw <- merge(df1, df2_short, by = c("id")) 
+
+nrow(df_patients_raw)
+
+#часть пациентов из df2 потеряли, так как о них не было информации в df1 
+```
+
+Преобразуем датафрейм с информацией о пациентах:
+
+- оставляем только нужные столбцы
+
+- переименовываем столбцы
+
+```{r}
+df_patients <- df_patients_raw %>% 
+  select(id, sex, virsta, cicode, rezolvare, StartDate,
+         hospit_days_total, OutcomeDate) %>% 
+  rename(age = virsta, diagnosis = cicode, outcome = rezolvare,
+         hospitalization = hospit_days_total)
+```
+
+
+Делаем один общий датафрейм по информации и результам анализов
+
+```{r}
+
+df_raw <- merge(df_patients, df_test, by = c("id"))
+n_raw <- length(unique(df_raw$id))
+n_raw #4180
+#потеряли часть пациентов из обоих датасетов - и df_patients, и df_test
+
+```
+
+Преобразуем даты анализов и считаем дни от анализа до исхода
+
+```{r}
+
+df_raw$date <- as.Date(df_raw$date)
+
+df_raw$DaysBfOutcome <- as.numeric(df_raw$OutcomeDate - df_raw$date)
+
+```
+
+
+Фильтрация по информации об исходе: outcomeFilter
+Исключаем пациентов, у которых исход не насту
+
+```{r}
+
+outcomeFilter <- function (x)
+{
+ y <- x %>% 
+ filter(outcome != "transfer inter-spitalicesc")
+ n_before <- length(unique(x$id))
+ n_after <- length(unique(y$id)) 
+ reduction <- n_before - n_after
+ print(str_c("Patients before filtration: ", as.character(n_before)))
+ print(str_c("Transferred patients: ", as.character(reduction)))
+ print(str_c("Patients after filtration: ", as.character(n_after)))
+ return(y)
+}
+
+data_raw <- outcomeFilter(df_raw)
+
+# Удалим из памяти промежуточный датафрейм, который не будет использоваться далее
+
+rm(df_raw)
+
+```
+
+
+
+Поменяем значения исходов в датасете на 1/0
+
+```{r}
+died_outcomes <- c("Decedat in Reanimare", "decedat in sectie", "Decedat in TI BCV", "Decedat in TI",  "Decedat in izolator")
+
+survived_outcomes <- c("externat", "externat la cerere")
+
+data_raw$outcome <- ifelse(data_raw$outcome 
+                               %in% died_outcomes, 1, 0)
+```
+
+Сделаем переменные пол, диагноз и исход факторами
+
+```{r}
+data_raw <- data_raw %>% 
+  mutate(sex = as.factor(sex)) %>% 
+  mutate(diagnosis = as.factor(diagnosis)) %>% 
+  mutate(outcome = as.factor(outcome))
+```
+
+## Преобразуем базу данных перед переводом в широкий формат
+
+Различные варианты названий анализов для показателей, фигурирующих в таблице 1 в референтной статье.
+
+```{r}
+ALT <- c("Dozarea alaninaminotransferazei (ALT) in ser", "Dozarea ALT (alaninaminotransferazei)")
+Amilasa <- c("Dozarea a-amilazei in lichidele biologice (mat. cinetica)", "Amilaza in sange")
+APTT <- c("Timpul de tromboplastina  partial active  (TTPA)", "Timpul de trombina cu sulfat de protamine", "Timpul de tromboplastina partial activa")
+AST <- c("Dozarea aspartataminotransferazei (AST) in ser", "Dozarea AST (aspartataminotransferazei)")
+Conj_bilirubin <- c("Dozarea bilirubina conjugata", "Bilirubina conjugata", "Dozarea bilirubinei conjugate")
+Creatinin <- c("Dozarea creatininei in ser sau urina", "Dozarea creatininei", "Creatinina", "Dozarea creatininei in ser")
+CRP <- c("Determinarea proteinei C-reactive", "CRP")
+D_dimer <- c("D-Dimer", "D-dimeri")
+Ferritin <- c("Determinarea feritinei", "Ferritin")
+Fibrinogen <- c("Fibrinogenul", "Fibrinogen")
+Glucose <- c("Dozarea glucozei", "Glucoza", "Dozarea glucozei in sange")
+Hemoglobin <- c("Dozarea hemoglobinei")
+LDG <- c("Dozarea lactatdehidrogenazei (LDH) in ser", "Lactat dehidrogenaza")
+Lymphocytes <- c("Limfocite")
+Monocytes <- c("Monocite")
+Neutrophils <- c("Segmentate")
+Platelets <- c("Numaratoarea trombocitelor")
+Potassium <- c("Dozarea potasiului in serul sanguin", "K", "K+")
+Procalcitonin <- c("Procalcitonina", "Determinarea Procalcitoninei")
+Sodium <- c("Dozarea sodiului in serul sanguin", "Na", "Na+")
+Total_protein <- c("Dozarea proteinei totale", "Dozarea proteinei  totale")
+Urea <- c("Dozarea ureei", "Ureea", "Uree")
+WBC <- c("Numaratoarea leucocitelor", "WBC")
+#BMI, Toponin I - показатели отсутствуют в базе
+```
+
+Заменяем названия тестов на английские: renameTest
+```{r}
+renameTest <- function(x) 
+{
+x$test <- ifelse(x$test %in% ALT, "ALT", x$test)
+x$test <- ifelse(x$test %in% Amilasa, "Amilasa", x$test)
+x$test <- ifelse(x$test %in% APTT, "APTT", x$test)
+x$test <- ifelse(x$test %in% AST, "AST", x$test)
+x$test <- ifelse(x$test %in% Conj_bilirubin, "Conj_bilirubin", x$test)
+x$test <- ifelse(x$test %in% Creatinin, "Creatinin", x$test)
+x$test <- ifelse(x$test %in% CRP, "CRP", x$test)
+x$test <- ifelse(x$test %in% D_dimer, "D_dimer", x$test)
+x$test <- ifelse(x$test %in% Ferritin, "Ferritin", x$test)
+x$test <- ifelse(x$test %in% Fibrinogen, "Fibrinogen", x$test)
+x$test <- ifelse(x$test %in% Glucose, "Glucose", x$test)
+x$test <- ifelse(x$test %in% Hemoglobin, "Hemoglobin", x$test)
+x$test <- ifelse(x$test %in% LDG, "LDG", x$test)
+x$test <- ifelse(x$test %in% Lymphocytes, "Lymphocytes", x$test)
+x$test <- ifelse(x$test %in% Monocytes, "Monocytes", x$test)
+x$test <- ifelse(x$test %in% Neutrophils, "Neutrophils", x$test)
+x$test <- ifelse(x$test %in% Platelets, "Platelets", x$test)
+x$test <- ifelse(x$test %in% Potassium, "Potassium", x$test)
+x$test <- ifelse(x$test %in% Procalcitonin, "Procalcitonin", x$test)
+x$test <- ifelse(x$test %in% Sodium, "Sodium", x$test)
+x$test <- ifelse(x$test %in% Total_protein, "Total_protein", x$test)
+x$test <- ifelse(x$test %in% Urea, "Urea", x$test)
+x$test <- ifelse(x$test %in% WBC, "WBC", x$test)
+return(x)
+}
+
+df_renamed <- renameTest(data_raw)
+
+# Удалим из памяти промежуточный датафрейм, который не будет использоваться далее
+
+rm(data_raw)
+```
+
+Преобразуем значения тестов в числовые и удаляем некорректные
+: correctValue
+
+(+правим D_dimer *1000)
+
+```{r}
+correctValue <- function(x)
+{
+  n_before <- length(unique(x$id))
+  x$value <- gsub('[_><]', '', x$value)
+  x$value <- gsub('min', '', x$value)
+  x$value <- trimws(x$value, which = c("both"), whitespace = "[ \t\r\n]")
+  x <- filter(x, !str_detect(value, '[A-z+/]'))
+  x$value <- as.numeric(as.character(x$value))
+  x$value <- ifelse(x$test == "D_dimer", x$value * 1000, x$value)
+  n_after <- length(unique(x$id)) 
+  reduction <- n_before - n_after
+  print(str_c("Patients before filtration: ", as.character(n_before)))
+  print(str_c("Lost patients: ", as.character(reduction)))
+  print(str_c("Patients after filtration: ", as.character(n_after)))
+  return(x)  
+}
+
+df_corr <- correctValue(df_renamed)
+
+# Посмотрим количество NA после очистки
+
+table(is.na(df_corr$value))
+
+```
+
+Фильтрация по наличию анализов, которые фигурировали в референтной статье: table1Filter
+
+```{r}
+
+table1 <- c("ALT", "Amilasa", "APTT", "AST",
+               "Conj_bilirubin", "Creatinin", "CRP", 
+               "D_dimer", "Ferritin",  "Fibrinogen", 
+               "Glucose", "Hemoglobin", "LDG",  "Lymphocytes",
+               "Monocytes", "Neutrophils", "Platelets", 
+               "Potassium","Procalcitonin", "Sodium",
+               "Total_protein", "Urea", "WBC")
+
+table1Filter <- function(x)
+  {
+  n_before <- length(unique(x$id))
+  x <- x %>%  filter(test %in% table1)
+  n_after <- length(unique(x$id)) 
+  reduction <- n_before - n_after
+print(str_c("Patients before filtration: ", as.character(n_before)))
+print(str_c("Lost patients: ", as.character(reduction)))
+print(str_c("Patients after filtration: ", as.character(n_after)))
+return(x)  
+}
+
+df_long <- table1Filter(df_corr)
+```
+
+Посмотрим сколько пациентов имело результаты по лабораторным тестам, входящим в шкалу.
+
+```{r}
+
+table3 <- c("APTT", "CRP", "D_dimer", "Glucose",
+            "Hemoglobin", "Lymphocytes", "Total_protein", 
+            "Urea", "WBC")
+df_table3 <- df_corr %>% 
+  filter(test %in% table3)
+length(unique(df_table3$id)) #4138
+
+```
+
+
+## Переводим базу в широкий формат
+
+```{r}
+
+# Рассчитаем медианные значения для случаев, когда в один день анализ был сделан несколько раз
+
+data_wide <- df_long %>%
+  group_by(id, sex, age, diagnosis, StartDate, OutcomeDate, outcome, hospitalization, date, test) %>% 
+  dplyr::summarise(value_med = median(value, na.rm = TRUE)) %>% 
+  pivot_wider(names_from = "test", values_from = "value_med") %>%
+  group_by(id) %>% 
+  arrange(id , date) %>%  
+  mutate_all(funs(na.locf(., na.rm = FALSE)))
+
+# Рассчитываем дни до исхода
+
+data_wide$DaysBfOutcome <- data_wide$OutcomeDate - data_wide$date
+
+
+```
+
+## Делаем финальную БД для анализа
+
+Делаем функции для фильтрации датасета. Фильтрация делается с помощью функций, чтобы понять сколько пациентов отсекает каждый фильтр.
+
+
+```{r}
+
+# Фильтрация по дате анализа. Анализ должен быть сделан раньше, чем за 21 день до исхода: day20Filter
+
+day20Filter <- function(x)
+{
+  y <- x %>% 
+    filter(DaysBfOutcome >= 0 & DaysBfOutcome < 21)
+  n_before <- length(unique(x$id))
+  n_after <- length(unique(y$id)) 
+  reduction <- n_before - n_after
+  print(str_c("Patients before filtration (analysis date): ", as.character(n_before)))
+  print(str_c("Filtered patients: ", as.character(reduction)))
+  print(str_c("Patients after filtration: ", as.character(n_after)))
+  return(y)
+}
+
+# Фильтрация по госпитализации менее 3-х дней: shortFilter. Длительность госпитализации должна быть 3 дня и больше
+
+shortFilter <- function(x)
+{
+  y <- x %>% 
+    filter(hospitalization > 2)
+  n_before <- length(unique(x$id))
+  n_after <- length(unique(y$id)) 
+  reduction <- n_before - n_after
+  print(str_c("Patients before filtration (hospitalisation duration): ", as.character(n_before)))
+  print(str_c("Filtered patients: ", as.character(reduction)))
+  print(str_c("Patients after filtration: ", as.character(n_after)))
+  return(y)
+}
+
+# Фильтрация по диагнозу: diagnosisFilter. Если пациент поступал по диагнозу, не связанному с заболеванием лёгких, он исключался из анализа.
+
+diagnosisFilter <- function(x){
+  respiratory <- c("B342", "B972", "J069", "J110", "J128",
+                   "J129", "J168", "J182", "J189", "J209",
+                   "J440", "J960", "J969", "U072")
+  y <- x %>% 
+    filter(diagnosis %in% respiratory)
+  n_before <- length(unique(x$id))
+  n_after <- length(unique(y$id)) 
+  reduction <- n_before - n_after
+  print(str_c("Patients before filtration (diagnosis): ", as.character(n_before)))
+  print(str_c("Filtered patients: ", as.character(reduction)))
+  print(str_c("Patients after filtration: ", as.character(n_after)))
+  return(y)
+}
+
+```
+
+```{r}
+
+
+data_final <- data_wide %>% 
+  shortFilter() %>% 
+  day20Filter() %>%
+  diagnosisFilter()
+
+
+
+```
+
+
+# Характеризуем рабочую базу данных пациентов
+
+Cколько пациентов умерло и выжило
+
+```{r}
+total <- length(unique(data_final$id)) 
+total #3162
+survived <- length(unique((data_final %>%
+                             filter(outcome == 0))$id)) 
+survived #2258
+round(survived/total*100, digits = 1) #71.4
+died <- length(unique((data_final %>% 
+                             filter(outcome == 1))$id))
+died #904
+round(died/total*100, digits = 1) #28.6
+```
+
+Cколько пациентов с каждым диагнозом
+
+```{r}
+data_final %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  group_by(diagnosis) %>% 
+  tally()
+```
+
+Продолжительность госпитализации выживших и умерших пациентов
+
+```{r}
+data_final %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  group_by(outcome) %>% 
+  summarise(
+    mean = mean(hospitalization, na.rm = TRUE)
+    %>% as.numeric() %>% round(digits = 1),
+    sd = sd(hospitalization, na.rm = TRUE)
+    %>% as.numeric() %>% round(digits = 1),
+    median = median(hospitalization, na.rm = TRUE)
+    %>% as.numeric() %>% round(digits = 1),
+    MAD = mad(hospitalization, na.rm = TRUE)
+    %>% as.numeric() %>% round(digits = 0),
+  ) %>% 
+  flextable()
+```
+
+Возраст
+
+```{r}
+data_final %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  group_by(outcome) %>% 
+    summarise(
+    median = median(age, na.rm = TRUE)  %>% round(digits = 1),
+    MAD = mad(age, na.rm = TRUE) %>% round(digits = 1)
+  ) %>% 
+  flextable()
+data_final %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+    ungroup() %>% 
+  summarise(
+    median = median(age, na.rm = TRUE)  %>% round(digits = 1),
+    MAD = mad(age, na.rm = TRUE) %>% round(digits = 1)
+  ) %>% 
+  flextable()
+ 
+```
+
+Распределение по полу
+
+```{r}
+total <- length(unique(data_final$id))
+total
+male <- length(unique((data_final %>%
+                             filter(sex == "M"))$id))
+male #1517
+round(male/total*100, digits = 1) #48
+female <- length(unique((data_final %>% 
+                             filter(sex == "F"))$id))
+female #1645
+round(female/total*100, digits = 1) #52
+```
+Таблица 1
+
+```{r}
+table1Stat <- list(
+  '__median' = function(x) {median(x, na.rm = TRUE) %>% round(digits = 1)},
+  '__MAD' = function(x) {mad(x, na.rm = TRUE) %>% round(digits = 1)}
+)
+
+data_final %>% 
+  distinct(id, .keep_all = TRUE) %>% 
+  ungroup() %>% 
+  summarise(across(table1, table1Stat)) %>% 
+  pivot_longer(everything()) %>% 
+  separate(name, into = c("Test", "Stat"), sep = "___") %>% 
+  pivot_wider(values_from = value,
+              names_from = Stat) %>% 
+  flextable()
+
+ 
+```
+
+
+## Графики базовых характеристик
+
+
+```{r}
+
+# Удаляем повторы для проведения анализа
+
+
+data_final %>% 
+  distinct(id, .keep_all = TRUE) -> df_basic
+```
+
+
+Продолжительность госпитализации
+
+```{r}
+ggplot(df_basic, aes(y = hospitalization, 
+                     x = outcome)) +
+  geom_boxplot(width = 0.4, aes(fill = outcome)) +
+  scale_fill_manual(values = c("#00BFC4", "#F8766B"))+
+  theme_classic() +
+  ylab("Продолжительность госпитализации, дни") +
+  xlab("Исход")
+```
+
+Возраст умерших (1) и выписавшихся (0) пациентов
+
+```{r}
+ggplot(df_basic, aes(y = age, 
+                     x = outcome,
+                     fill = outcome)) +
+  geom_boxplot(width = 0.4) +
+  scale_fill_manual(values = c("#00BFC4", "#F8766B")) +
+  theme_classic() +
+  ylab("Возраст, лет") +
+  xlab("Исход")
+```
+
+Гистограмма с датами поступления умерших и выписавшихся пациентов
+
+```{r}
+ggplot(df_basic, aes(x = StartDate, fill = outcome)) +
+    geom_histogram(binwidth = 7) +
+    scale_fill_manual(values = c("#00BFC4", "#F8766B"))+
+    theme_classic() +
+    xlab("Дата госпитализации")+
+    ylab("Число пациентов")+
+    labs(fill = "Исход")
+
+summary(df_basic$StartDate)
+summary(df_basic$OutcomeDate)
+```
+
+# Валидация шкалы
+
+Создаём отдельный датафрейм с 9 интересующими нас параметрами.
+
+```{r}
+
+# Т.к. эти фрагменты работ выполнялись разными авторами параллельно, 
+# имена столбцов были изменены чтобы код сохранил работоспособность.
+
+score_9 <- data_final %>% 
+    select(id, 
+           Outcome = outcome, 
+           DaysBfOutcome, 
+           DayOfHosp = hospitalization, 
+           AnalysisDate = date, 
+           `d-dimer` = `D_dimer`, 
+           urea = Urea, 
+           limphocite_perc = Lymphocytes, 
+           crp = CRP, 
+           protein_total = Total_protein, 
+           aptt = APTT, 
+           wbc = WBC, 
+           hg = Hemoglobin, 
+           glucose = Glucose) %>% 
+    ungroup() %>% 
+    mutate(DayOfHosp = as.numeric(DayOfHosp),
+           DaysBfOutcome = as.numeric(DaysBfOutcome),
+           limphocite_perc = limphocite_perc / 100 * wbc)
+
+score_9 %>% summary()
+
+```
+
+Рассчитываем score (значения шкалы) по способу, описанному в статье
+
+```{r}
+
+score_9 <- score_9 %>% 
+    mutate(score = if_else(score_9$'d-dimer' > 2149 & !is.na(score_9$'d-dimer'), 4, 0) +
+                   if_else(score_9$urea > 11 & !is.na(score_9$urea), 5, 0) +
+                   if_else(score_9$limphocite_perc < 0.7 & !is.na(score_9$limphocite_perc), 3, 0) +
+                   if_else(score_9$crp > 146 & !is.na(score_9$crp), 3, 0) +
+                   if_else(score_9$protein_total < 61 & !is.na(score_9$protein_total), 6, 0) +
+                   if_else(score_9$aptt > 42 & !is.na(score_9$aptt), 4, 0) +
+                   if_else(score_9$wbc > 13.5 & !is.na(score_9$wbc), 4, 0) +
+                   if_else(score_9$hg < 115 & !is.na(score_9$hg), 3, 0) +
+                   if_else(score_9$glucose > 9 & !is.na(score_9$glucose), 4, 0))
+
+```
+
+## Оценка динамики показателя score по мере приближения к исходу
+
+```{r}
+
+score_9 %>% 
+    group_by(Outcome, DaysBfOutcome) %>% 
+    summarise(M = mean(score),
+              LCL = t.test(score)$conf.int[1],
+              UCL = t.test(score)$conf.int[2]) %>% 
+  ggplot(aes(x = DaysBfOutcome, y = M, colour = Outcome)) + 
+  geom_linerange(aes(ymin = LCL, ymax = UCL)) +
+  geom_line() +
+  geom_point() + 
+  theme_bw() + 
+  ylab("Average score + 95% CI") + 
+  xlab("Day before outcome") +
+  scale_color_manual(labels=c("Discharge","Death"), values = c("#00BFC4", "#F8766B")) + 
+  scale_x_reverse(breaks = seq(20, 0, -2))
+
+```
+
+Мы видим, что по мере приближения к исходу различия в показателе score между выписавшимися и умершими пациентами нарастают.
+
+## Интерпретация показателя
+
+Оценим, как именно рост показателя score связан с шансом развития летального исхода на разных сроках
+
+```{r}
+
+# Сначала у каждого пациента считается максимальное значение score
+
+score_9_max <- score_9 %>% 
+    group_by(id, Outcome) %>% 
+    summarise(score = max(score, na.rm = TRUE))
+
+# Строится модель логистической регрессии для данного значения 
+
+glm_outcome <- glm(Outcome ~ score, family=binomial, data = score_9_max)
+
+# Построим таблицу ожидаемых вероятностей летального исхода с помощью модели
+
+score <- seq(1, 36, by = 1)
+scores <- as.data.frame(score)
+predictions <- predict.glm(glm_outcome, scores, type="response", se.fit = TRUE)
+
+# Рассчитаем ДИ
+
+scores$outcome_pr <- predictions$fit
+ci <- 1.96 * predictions$se.fit
+scores$ci_low_pr <- predictions$fit - ci
+scores$ci_up_pr <- predictions$fit + ci
+
+# Рассчитаем шансы летального исхода и ДИ для них (odd = death probability/discharge probability)
+
+scores$odd <- round(scores$outcome_pr/(1- scores$outcome_pr), 5)
+scores$ci_low_odd <- round(scores$ci_low_pr/(1- scores$ci_low_pr), 5)
+scores$ci_up_odd <- round(scores$ci_up_pr/(1-scores$ci_up_pr), 5)
+scores$score <- as.factor(scores$score)
+
+# Построим график зависимости шанса летального исхода от значений score
+
+ggplot(scores, aes(x=score, y=odd)) + 
+    geom_linerange(aes(ymin=ci_low_odd, ymax=ci_up_odd)) +
+    geom_line() +
+    geom_point() + 
+    theme_bw() + 
+    scale_y_log10(limits = c(0.001, 200), 
+                  breaks=c(0.001,0.01,0.1,1,10,100), 
+                  labels = c("1/1000", "1/100", "1/10", "1","10","100")) + 
+    labs(x = "Максимальная оценка по score",
+         y = "Шанс летального исхода")
+
+```
+
+Построим таблицу для оценки градаций риска.
+
+```{r}
+
+thresholds <- c("<4", "[4, 8)", "[8, 14)", "[14, 20)", ">=20")
+odds <- c("< 1:100","1:100 - 1:25", "1:25 -  1:5", "1:5 - 1:1", ">1:1")
+risk_grade <- c("Very Low", "Low", "Average", "High", "Very High")
+data <- data.frame(thresholds, odds, risk_grade)
+colnames(data) <- c("Score range", "Expected death/discharge odds", "Risk grade")
+data %>% flextable(cwidth = 1.5) %>%
+  theme_box() %>%
+  align(align = "center", part = "all") 
+
+```
+
+Построим график для оценки шансов летального исхода по аналогии с графиков в референтной статье.
+
+```{r}
+
+data <- filter(scores, score %in% c(4,8,14,20))
+
+ggplot(data, aes(x=score, y=odd, color = "")) + 
+    geom_errorbar(aes(ymin=ci_low_odd, ymax=ci_up_odd), width=.1) +
+    geom_line() +
+    geom_point() + 
+    theme_bw() + 
+    scale_y_log10(breaks = c(0.01,0.04,0.2,1), labels = c("1/100","1/25","1/5","1")) + 
+    ylab("Odds + 95% CI") + 
+    xlab("Score grades") + 
+    theme(legend.position = "none")
+
+```
+
+## Анализ времени до наступления исхода
+
+```{r}
+
+# Считаем максимальный день до исхода, когда первый раз сработал score для каждого пациента.
+
+PrRange <- data.frame(score = NA, M = NA, LCL = NA, UCL = NA) %>% 
+  mutate_all(~ as.numeric(.x))
+
+for (i in 1:length(unique(score_9$score))) {
+  score_9 %>% 
+    filter(Outcome == 1, score >= unique(score_9$score)[i]) %>%
+    mutate(DaysBfOutcome = as.character(DaysBfOutcome) %>% as.numeric()) %>% 
+    group_by(id) %>% 
+    summarise(first_trigger = max(DaysBfOutcome)) %>% 
+    ungroup() %>% 
+    summarise(M = mean(first_trigger),
+              LCL = t.test(first_trigger)$conf.int[1],
+              UCL = t.test(first_trigger)$conf.int[2]) -> stats
+  PrRange[i, "score"] <- unique(score_9$score)[i]
+  PrRange[i, "M"] <- stats$M[1]
+  PrRange[i, "LCL"] <- stats$LCL[1]
+  PrRange[i, "UCL"] <- stats$UCL[1]
+}
+
+PrRange
+
+```
+
+
+```{r, fig.height = 3, fig.width = 5, dpi = 300}
+
+PrRange %>% ggplot(aes(x = score)) +
+  geom_point(aes(y = M)) + 
+  geom_linerange(aes(ymin = LCL, ymax = UCL)) +
+  labs(x = "Prognostic score threshold",
+       y = "Average prediction range") + 
+  scale_x_continuous(breaks = seq(0, 36, by = 4)) +
+  scale_y_continuous(breaks = seq(0, 10, by = 2)) +
+  theme_bw()
+
+```
+
+## Анализ чувствительности и специфичности шкалы
+
+```{r}
+
+# Строим таблицу с частотами умерших и выживших пациентов на каждом уровне максимального score
+
+score_9_max %>% 
+  group_by(score) %>% 
+  summarise(n_dead = sum(Outcome == 1),
+            N = sum(!is.na(Outcome))) %>% 
+  mutate(n_surv = N - n_dead, 
+         freq_dead = (100 * n_dead / N) %>% round(1),
+         freq_surv = (100 * n_surv / N) %>% round(1),                
+         .before = N) -> SurvDeadRate
+
+SurvDeadRate %>% head() %>% flextable() %>% theme_box()
+
+```
+
+Построим график, как менялась доля умерших пациентов в зависимости от уровня score.
+
+```{r, fig.height = 3, fig.width = 6, dpi = 300}
+
+
+
+ggplot(SurvDeadRate, aes(x = score)) +
+  geom_line(aes(y = freq_dead)) + 
+  theme_bw() + 
+  labs(y = "Доля умерших пациентов, %",
+       x = "Максимальная оценка по score")
+
+```
+
+```{r}
+
+# С помощью цикла рассчитываем значения TP, FP, TN и FN для максимальных значений score
+
+TP <- c()
+TN <- c()
+FP <- c()
+FN <- c()
+
+for (i in 1:length(SurvDeadRate$score)) {
+  TP[i] <- SurvDeadRate %>% filter(score > score[i]) %>% pull(n_dead) %>% sum()
+  FP[i] <- SurvDeadRate %>% filter(score > score[i]) %>% pull(n_surv) %>% sum()
+  TN[i] <- SurvDeadRate %>% filter(score <= score[i]) %>% pull(n_surv) %>% sum()
+  FN[i] <- SurvDeadRate %>% filter(score <= score[i]) %>% pull(n_dead) %>% sum()
+}
+
+Sens_DB <- tibble(score = SurvDeadRate$score, TP, FP, TN, FN) %>%
+  mutate(Sensitivity = 100 * TP / (TP + FN),
+         Specificity = 100 * TN / (TN + FP)) %>% 
+  rowwise() %>% 
+  mutate(LCL_Se = 100*binom.test(c(TP, FN))$conf.int[1],
+         UCL_Se = 100*binom.test(c(TP, FN))$conf.int[2],
+         LCL_Sp = 100*binom.test(c(TN, FP))$conf.int[1],
+         UCL_Sp = 100*binom.test(c(TN, FP))$conf.int[2],)
+
+Sens_DB %>% head() %>% flextable() %>% theme_box()
+
+```
+
+Построим графики для чувствительности и специфичности выявления летальных случаев в зависимости от 
+различных пороговых значений максимального score, наблюдавшегося у пациентов.
+
+```{r, fig.height = 3, fig.width = 6, dpi = 300}
+
+Sens_DB_Se <- Sens_DB %>% 
+  select(score, value = Sensitivity, LCL = LCL_Se, UCL = UCL_Se) %>% 
+  mutate(`Score efficiency` = "Sensitivity")
+
+Sens_DB_Sp <- Sens_DB %>% 
+  select(score, value = Specificity, LCL = LCL_Sp, UCL = UCL_Sp) %>% 
+  mutate(`Score efficiency` = "Specificity")
+
+rbind(Sens_DB_Se, Sens_DB_Sp) %>% 
+  ggplot(aes(x = score, color = `Score efficiency`, fill = `Score efficiency`)) +
+    geom_ribbon(aes(ymin = LCL, ymax = UCL), alpha = 0.3, color = NA) + 
+    geom_line(aes(y = value), size = 1) +
+    labs(x = "Prognostic score threshold",
+         y = "Sensitivity / Specificity") + 
+    scale_y_continuous(breaks = seq(0, 100, by = 20)) +
+    scale_x_continuous(breaks = seq(0, 36, by = 4)) +
+    theme_bw()
+
+```
+
+
+
+
